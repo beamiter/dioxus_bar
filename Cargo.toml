@@ -1,0 +1,19 @@
+[package]
+name = "dioxus_bar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+wasm-bindgen = "0.2.104"
+web-sys = "0.3.81"
+
+tokio = { version = "1.47.1", features = ["full"] }
+chrono = "0.4.42"
+log = "0.4.28"
+xbar_core = { git = "https://github.com/beamiter/xbar_core.git" }
+shared_structures = { git = "https://github.com/beamiter/shared_structures.git", features = ["use-futex"] }
+serde = { version = "1.0.228", features = ["derive"] }
+libc = "0.2.176"
+
+dioxus = { version = "0.7.2", features = ["desktop"] }
+dioxus-desktop = "0.7.2"

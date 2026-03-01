@@ -1,0 +1,159 @@
+:root {
+  --bg: transparent;
+  --text: #202124;
+
+  /* tag 基础色（按顺序 1~9），对应 iced_bar 的 tab_colors */
+  --tag-1: #FF6B6B;
+  --tag-2: #4ECDC4;
+  --tag-3: #45B7D1;
+  --tag-4: #96CEB4;
+  --tag-5: #FECA57;
+  --tag-6: #FF9FF3;
+  --tag-7: #54A0FF;
+  --tag-8: #5F27CD;
+  --tag-9: #00D2D3;
+
+  --pill-radius: 12px;
+  --pill-padding-y: 4px;
+  --pill-padding-x: 10px;
+  --pill-font-size: 14px;
+
+  --good: #1fbf51;
+  --warn: #f4c20d;
+  --caution: #ff8c1a;
+  --danger: #e53935;
+
+  --layout-open: #3cb371; /* 绿色 */
+  --layout-closed: #d35400; /* 橙色 */
+
+  --scr-cyan: #00cccc;
+  --scr-orange: #ff8800;
+
+  --time-blue: #4da3ff;
+  --monitor-purple: #9b59b6;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body, html {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Noto Sans", "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", Arial, sans-serif;
+  font-size: 14px;
+}
+
+.button-row {
+  display: flex;
+  align-items: center;
+  padding: 4px 6px;
+  gap: 6px;
+  user-select: none;
+}
+
+/* 左侧容器：工作区 + 布局切换 */
+.buttons-container {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 右侧容器：系统指标 + 截图 + 时间 + 显示器 */
+.right-info-container {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 中间撑开 */
+.spacer {
+  flex: 1 1 auto;
+}
+
+/* 通用 pill 基础 */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--pill-radius);
+  padding: var(--pill-padding-y) var(--pill-padding-x);
+  font-size: var(--pill-font-size);
+  line-height: 1;
+  border: 1px solid transparent;
+  transition: all 120ms ease-in-out;
+  white-space: nowrap;
+}
+
+/* 工作区按钮（保持不变） */
+.emoji-button {
+  width: 40px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 120ms ease-in-out;
+}
+
+/* nth-child 为每个按钮设定 --tag-color（循环顺序与 HTML 渲染一致） */
+.buttons-container .emoji-button:nth-child(1)  { --tag-color: var(--tag-1); }
+.buttons-container .emoji-button:nth-child(2)  { --tag-color: var(--tag-2); }
+.buttons-container .emoji-button:nth-child(3)  { --tag-color: var(--tag-3); }
+.buttons-container .emoji-button:nth-child(4)  { --tag-color: var(--tag-4); }
+.buttons-container .emoji-button:nth-child(5)  { --tag-color: var(--tag-5); }
+.buttons-container .emoji-button:nth-child(6)  { --tag-color: var(--tag-6); }
+.buttons-container .emoji-button:nth-child(7)  { --tag-color: var(--tag-7); }
+.buttons-container .emoji-button:nth-child(8)  { --tag-color: var(--tag-8); }
+.buttons-container .emoji-button:nth-child(9)  { --tag-color: var(--tag-9); }
+
+.emoji-button.state-default { background: transparent; border-color: transparent; }
+.emoji-button.state-occupied { background: rgba(127,127,127,0.12); border-color: transparent; }
+.emoji-button.state-selected { background: rgba(127,127,127,0.22); border-color: var(--tag-color); border-width: 1.5px; }
+.emoji-button.state-filtered { background: var(--tag-color); border-color: var(--tag-color); border-width: 2px; color: #000; }
+.emoji-button.state-urgent { background: rgba(255, 0, 0, 0.8); border-color: #8a2be2; border-width: 2.5px; color: #fff; }
+
+.emoji-button:hover { filter: brightness(1.05); border-width: 2px; }
+.emoji-button.pressed { transform: translateY(1px) scale(0.98); filter: brightness(0.95); }
+
+.layout-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+}
+
+.layout-toggle { cursor: pointer; color: #fff; }
+.layout-toggle.open   { background: rgba(60, 179, 113, 0.85); border-color: #3cb371; }
+.layout-toggle.closed { background: rgba(211, 84, 0, 0.85);  border-color: #d35400; }
+.layout-toggle:hover { filter: brightness(1.05); border-width: 2px; }
+
+.layout-selector { display: inline-flex; align-items: center; gap: 6px; }
+.layout-option { cursor: pointer; color: #fff; background: rgba(65, 105, 225, 0.85); border-color: #4169e1; }
+.layout-option.current { background: rgba(60, 179, 113, 0.9); border-color: #3cb371; border-width: 2px; }
+.layout-option:hover { filter: brightness(1.05); border-width: 2px; }
+
+/* 系统指标（CPU/MEM/电池） pill */
+.system-info-container { display: inline-flex; align-items: center; gap: 6px; }
+
+.usage-pill { color: #fff; border-width: 1px; }
+.usage-good    { background: rgba(31, 191, 81, 0.90);  border-color: #1fbf51; }
+.usage-warn    { background: rgba(244, 194, 13, 0.90); border-color: #f4c20d; color: #000; }
+.usage-caution { background: rgba(255, 140, 26, 0.90); border-color: #ff8c1a; }
+.usage-danger  { background: rgba(229, 57, 53, 0.90);  border-color: #e53935; }
+
+/* 截图 pill */
+.screenshot-pill { cursor: pointer; color: #fff; background: rgba(0, 204, 204, 0.9); border-color: #00cccc; }
+.screenshot-pill:hover { background: rgba(255, 136, 0, 0.95); border-color: #ff8800; }
+
+/* 时间 pill */
+.time-pill { color: #fff; background: rgba(77, 163, 255, 0.90); border-color: #4da3ff; cursor: pointer; }
+
+/* 监视器/缩放 pill */
+.monitor-pill { color: #fff; background: rgba(155, 89, 182, 0.90); border-color: #9b59b6; }
+.scale-pill   { color: #fff; background: rgba(120, 120, 120, 0.88); border-color: #777; }

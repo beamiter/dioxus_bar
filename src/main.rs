@@ -7,7 +7,7 @@ use log::{debug, error, info, warn};
 use std::{
     env,
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -16,11 +16,82 @@ use shared_structures::{CommandType, SharedCommand, SharedMessage, SharedRingBuf
 use xbar_core::initialize_logging;
 use xbar_core::system_monitor::SystemMonitor;
 use xbar_core::system_monitor::SystemSnapshot;
+use xbar_core::{AudioManager, BrightnessManager};
 
-// 在编译时直接包含CSS文件
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 
-// 优化的共享内存工作线程 - 降低CPU使用率
+// ===== Nerd Font 图标（与 tauri_react_bar 对齐） =====
+const TAG_ICONS: &[&str] = &[
+    "\u{F0A1E}", // terminal
+    "\u{F0239}", // browser
+    "\u{F0A1B}", // code
+    "\u{F0B79}", // chat
+    "\u{F024B}", // folder
+    "\u{F0388}", // music
+    "\u{F0567}", // video
+    "\u{F01F0}", // mail
+    "\u{F0297}", // gamepad
+];
+
+const ICON_CPU: &str = "\u{F4BC}";
+const ICON_MEM: &str = "\u{F035B}";
+const ICON_BAT_FULL: &str = "\u{F0079}";
+const ICON_BAT_CHG: &str = "\u{F0084}";
+const ICON_VOL_HIGH: &str = "\u{F057E}";
+const ICON_VOL_MID: &str = "\u{F0580}";
+const ICON_VOL_LOW: &str = "\u{F057F}";
+const ICON_VOL_MUTE: &str = "\u{F075F}";
+const ICON_BRIGHT: &str = "\u{F00DE}";
+const ICON_SHOT: &str = "\u{F0104}";
+const ICON_TIME: &str = "\u{F0954}";
+const ICON_MON: &str = "\u{F0379}";
+
+fn monitor_icon_glyph(num: i32) -> &'static str {
+    match num {
+        0 => "\u{F02DA}",
+        1 => "\u{F02DB}",
+        _ => "?",
+    }
+}
+
+fn volume_icon(snap: Option<&AudioSnapshot>) -> &'static str {
+    match snap {
+        None => ICON_VOL_MUTE,
+        Some(s) if !s.has_device || s.is_muted || s.volume <= 0 => ICON_VOL_MUTE,
+        Some(s) if s.volume < 34 => ICON_VOL_LOW,
+        Some(s) if s.volume < 67 => ICON_VOL_MID,
+        Some(_) => ICON_VOL_HIGH,
+    }
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct AudioSnapshot {
+    volume: i32,
+    is_muted: bool,
+    has_device: bool,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct BrightnessSnapshot {
+    percent: Option<u8>,
+}
+
+fn audio_snapshot_from(am: &AudioManager) -> AudioSnapshot {
+    if let Some(d) = am.get_master_device() {
+        AudioSnapshot {
+            volume: d.volume.clamp(0, 100),
+            is_muted: d.is_muted,
+            has_device: true,
+        }
+    } else {
+        AudioSnapshot {
+            volume: 0,
+            is_muted: true,
+            has_device: false,
+        }
+    }
+}
+
 fn shared_memory_worker(
     shared_buffer_opt: Option<Arc<SharedRingBuffer>>,
     message_sender: tokio::sync::mpsc::Sender<SharedMessage>,
@@ -32,11 +103,11 @@ fn shared_memory_worker(
         .as_millis();
     if let Some(shared_buffer) = shared_buffer_opt {
         loop {
-            match shared_buffer.wait_for_message(Some(std::time::Duration::from_secs(2))) {
+            match shared_buffer.wait_for_message(Some(Duration::from_secs(2))) {
                 Ok(true) => {
                     if let Ok(Some(message)) = shared_buffer.try_read_latest_message() {
-                        if prev_timestamp != message.timestamp.into() {
-                            prev_timestamp = message.timestamp.into();
+                        if prev_timestamp != message.timestamp as u128 {
+                            prev_timestamp = message.timestamp as u128;
                             if let Err(e) = message_sender.blocking_send(message) {
                                 error!("Failed to send message: {}", e);
                                 break;
@@ -52,7 +123,6 @@ fn shared_memory_worker(
             }
         }
     }
-
     info!("Shared memory worker task exiting");
 }
 
@@ -86,17 +156,14 @@ fn send_layout_command(shared_buffer: &SharedRingBuffer, monitor_id: i32, layout
     the_cmd_send(shared_buffer, cmd);
 }
 
-/// 格式化字节为人类可读的格式
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     let mut size = bytes as f64;
     let mut unit_index = 0;
-
     while size >= 1024.0 && unit_index < UNITS.len() - 1 {
         size /= 1024.0;
         unit_index += 1;
     }
-
     if unit_index == 0 {
         format!("{:.0}{}", size, UNITS[unit_index])
     } else {
@@ -104,56 +171,51 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-// 截图按钮组件（Pill）
+// 截图按钮
 #[component]
 fn ScreenshotButton() -> Element {
     let mut is_taking_screenshot = use_signal(|| false);
 
     let take_screenshot = move |_| {
         if is_taking_screenshot() {
-            return; // 防止重复点击
+            return;
         }
-
         is_taking_screenshot.set(true);
         info!("Taking screenshot with flameshot");
-
-        // 在新线程中执行截图命令，避免阻塞UI
         spawn(async move {
             let result =
                 tokio::task::spawn_blocking(|| Command::new("flameshot").arg("gui").spawn()).await;
-
             match result {
                 Ok(Ok(mut child)) => {
                     info!("Flameshot launched successfully");
-                    // 等待命令完成
                     let _ = tokio::task::spawn_blocking(move || child.wait()).await;
                 }
-                Ok(Err(e)) => {
-                    error!("Failed to launch flameshot: {}", e);
-                }
-                Err(e) => {
-                    error!("Task error when launching flameshot: {}", e);
-                }
+                Ok(Err(e)) => error!("Failed to launch flameshot: {}", e),
+                Err(e) => error!("Task error when launching flameshot: {}", e),
             }
-
             is_taking_screenshot.set(false);
         });
     };
 
+    let cls = if is_taking_screenshot() {
+        "pill screenshot-pill taking"
+    } else {
+        "pill screenshot-pill"
+    };
+
     rsx! {
         div {
-            class: "pill screenshot-pill",
+            class: "{cls}",
             onclick: take_screenshot,
             title: "截图 (Flameshot)",
-            {if is_taking_screenshot() { "⏳" } else { "📸" }}
+            span { class: "nf-icon", "{ICON_SHOT}" }
         }
     }
 }
 
-/// 系统信息显示组件（Pill）
+// 系统信息（CPU/MEM/电池）
 #[component]
 fn SystemInfoDisplay(snapshot: Option<SystemSnapshot>) -> Element {
-    // 阈值 -> class
     let sev = |p: f32| {
         if p <= 30.0 {
             "usage-good"
@@ -169,8 +231,6 @@ fn SystemInfoDisplay(snapshot: Option<SystemSnapshot>) -> Element {
     if let Some(ref s) = snapshot {
         let cpu_class = sev(s.cpu_average as f32);
         let mem_class = sev(s.memory_usage_percent as f32);
-
-        // 电池按高->低好到差
         let batt_class = if s.battery_percent > 50.0 {
             "usage-good"
         } else if s.battery_percent > 20.0 {
@@ -193,48 +253,177 @@ fn SystemInfoDisplay(snapshot: Option<SystemSnapshot>) -> Element {
         } else {
             format!("电池电量: {:.1}%", s.battery_percent)
         };
-        let batt_icon = if s.is_charging { "🔌" } else { "🔋" };
+        let batt_icon = if s.is_charging { ICON_BAT_CHG } else { ICON_BAT_FULL };
+        let cpu_text = format!("{:.0}%", s.cpu_average);
+        let mem_text = format!("{:.0}%", s.memory_usage_percent);
+        let batt_text = format!("{:.0}%", s.battery_percent);
 
         rsx! {
             div { class: "system-info-container",
                 div { class: "{cpu_cls}", title: "CPU 平均使用率",
-                    {format!("CPU {:.0}%", s.cpu_average)}
+                    span { class: "nf-icon", "{ICON_CPU}" }
+                    "{cpu_text}"
                 }
                 div { class: "{mem_cls}", title: "{mem_title}",
-                    {format!("MEM {:.0}%", s.memory_usage_percent)}
+                    span { class: "nf-icon", "{ICON_MEM}" }
+                    "{mem_text}"
                 }
                 div { class: "{batt_cls}", title: "{batt_title}",
-                    {format!("{} {:.0}%", batt_icon, s.battery_percent)}
+                    span { class: "nf-icon", "{batt_icon}" }
+                    "{batt_text}"
                 }
             }
         }
     } else {
         rsx! {
             div { class: "system-info-container",
-                div { class: "pill usage-pill usage-warn", "CPU --%" }
-                div { class: "pill usage-pill usage-warn", "MEM --%" }
-                div { class: "pill usage-pill usage-warn", "🔋 --%" }
+                div { class: "pill usage-pill usage-warn",
+                    span { class: "nf-icon", "{ICON_CPU}" }
+                    "--%"
+                }
+                div { class: "pill usage-pill usage-warn",
+                    span { class: "nf-icon", "{ICON_MEM}" }
+                    "--%"
+                }
+                div { class: "pill usage-pill usage-warn",
+                    span { class: "nf-icon", "{ICON_BAT_FULL}" }
+                    "--%"
+                }
             }
         }
     }
 }
 
-/// 时间文本组件（只输出文本）
+// 音量控制
+#[component]
+fn VolumeControl(
+    snapshot: Option<AudioSnapshot>,
+    audio_manager: Signal<Arc<Mutex<AudioManager>>>,
+) -> Element {
+    let snap = snapshot.clone();
+    let muted = snap
+        .as_ref()
+        .map(|s| s.is_muted || !s.has_device)
+        .unwrap_or(true);
+    let has_device = snap.as_ref().map(|s| s.has_device).unwrap_or(false);
+    let vol = snap.as_ref().map(|s| s.volume).unwrap_or(0);
+    let icon = volume_icon(snap.as_ref());
+    let label = if has_device {
+        format!("{}%", vol)
+    } else {
+        "--".to_string()
+    };
+    let cls = if muted {
+        "pill volume-pill muted"
+    } else {
+        "pill volume-pill"
+    };
+
+    let on_click = move |_| {
+        let am = audio_manager.read().clone();
+        if let Ok(mut am) = am.lock() {
+            if let Some(dev) = am.get_master_device().cloned() {
+                if let Err(e) = am.toggle_mute(&dev.name) {
+                    warn!("toggle_mute failed: {}", e);
+                }
+            }
+        }
+    };
+    let on_context = move |evt: Event<MouseData>| {
+        evt.prevent_default();
+        let am = audio_manager.read().clone();
+        if let Ok(mut am) = am.lock() {
+            if let Some(dev) = am.get_master_device().cloned() {
+                let _ = am.adjust_volume(&dev.name, -5);
+            }
+        }
+    };
+    let on_wheel = move |evt: Event<WheelData>| {
+        evt.prevent_default();
+        let dy = evt.data().delta().strip_units().y;
+        let delta = if dy < 0.0 { 5 } else { -5 };
+        let am = audio_manager.read().clone();
+        if let Ok(mut am) = am.lock() {
+            if let Some(dev) = am.get_master_device().cloned() {
+                let _ = am.adjust_volume(&dev.name, delta);
+            }
+        }
+    };
+
+    rsx! {
+        div {
+            class: "{cls}",
+            onclick: on_click,
+            oncontextmenu: on_context,
+            onwheel: on_wheel,
+            title: "左键静音 / 滚轮调节 / 右键 -5",
+            span { class: "nf-icon", "{icon}" }
+            "{label}"
+        }
+    }
+}
+
+// 亮度控制
+#[component]
+fn BrightnessControl(
+    snapshot: Option<BrightnessSnapshot>,
+    brightness_manager: Signal<Arc<Mutex<BrightnessManager>>>,
+) -> Element {
+    let pct = snapshot.as_ref().and_then(|s| s.percent);
+    let label = match pct {
+        Some(p) => format!("{}%", p),
+        None => "--".to_string(),
+    };
+
+    let on_click = move |_| {
+        let bm = brightness_manager.read().clone();
+        if let Ok(mut bm) = bm.lock() {
+            bm.adjust(5);
+        }
+    };
+    let on_context = move |evt: Event<MouseData>| {
+        evt.prevent_default();
+        let bm = brightness_manager.read().clone();
+        if let Ok(mut bm) = bm.lock() {
+            bm.adjust(-5);
+        }
+    };
+    let on_wheel = move |evt: Event<WheelData>| {
+        evt.prevent_default();
+        let dy = evt.data().delta().strip_units().y;
+        let delta = if dy < 0.0 { 5 } else { -5 };
+        let bm = brightness_manager.read().clone();
+        if let Ok(mut bm) = bm.lock() {
+            bm.adjust(delta);
+        }
+    };
+
+    rsx! {
+        div {
+            class: "pill brightness-pill",
+            onclick: on_click,
+            oncontextmenu: on_context,
+            onwheel: on_wheel,
+            title: "左键加亮 / 右键减暗 / 滚轮调节",
+            span { class: "nf-icon", "{ICON_BRIGHT}" }
+            "{label}"
+        }
+    }
+}
+
+// 时间文本
 #[component]
 fn TimeText(show_seconds: bool) -> Element {
     let mut current_time = use_signal(|| Local::now());
 
-    // 时间更新循环
     use_effect(move || {
         spawn(async move {
             loop {
-                // 根据是否显示秒来决定更新频率
                 let update_interval = if show_seconds {
-                    Duration::from_millis(1000) // 显示秒时每秒更新
+                    Duration::from_millis(1000)
                 } else {
-                    Duration::from_millis(60000) // 不显示秒时每分钟更新
+                    Duration::from_millis(60000)
                 };
-
                 tokio::time::sleep(update_interval).await;
                 current_time.set(Local::now());
             }
@@ -253,10 +442,6 @@ fn TimeText(show_seconds: bool) -> Element {
     }
 }
 
-// 将按钮数据定义为静态常量（可改为你的动物 emoji，以保持样式不变，这里用更语义化的）
-const BUTTONS: &[&str] = &["🏠", "💻", "🌐", "🎵", "📁", "🎮", "📧", "🔧", "📊"];
-
-// 定义按钮状态枚举
 #[derive(Debug, Clone, PartialEq)]
 enum ButtonState {
     Filtered,
@@ -292,7 +477,6 @@ impl ButtonState {
     }
 }
 
-// 按钮状态数据结构
 #[derive(Debug, Clone, Default, PartialEq)]
 struct ButtonStateData {
     is_filtered: bool,
@@ -322,14 +506,12 @@ fn main() {
         error!("Failed to initialize logging: {}", e);
         std::process::exit(1);
     }
-    // 环境信息
     info!("=== Environment Debug Info ===");
     info!("DISPLAY: {:?}", env::var("DISPLAY"));
     info!("WAYLAND_DISPLAY: {:?}", env::var("WAYLAND_DISPLAY"));
     info!("XDG_SESSION_TYPE: {:?}", env::var("XDG_SESSION_TYPE"));
     info!("DESKTOP_SESSION: {:?}", env::var("DESKTOP_SESSION"));
     info!("XDG_CURRENT_DESKTOP: {:?}", env::var("XDG_CURRENT_DESKTOP"));
-    // 屏幕分辨率（如果可能）
     if let Ok(output) = Command::new("xrandr").arg("--current").output() {
         let output_str = String::from_utf8_lossy(&output.stdout);
         for line in output_str.lines() {
@@ -363,15 +545,15 @@ fn App() -> Element {
         std::env::var("SHARED_MEMORY_PATH").unwrap_or_else(|_| "/dev/shm/monitor_0".to_string())
     });
 
-    // 窗口/缩放因子
     let window = use_window();
     let scale_factor = use_signal(|| window.scale_factor());
 
-    // 按钮状态数组
-    let mut button_states = use_signal(|| vec![ButtonStateData::default(); BUTTONS.len()]);
+    let mut button_states = use_signal(|| vec![ButtonStateData::default(); TAG_ICONS.len()]);
     let mut last_update = use_signal(|| Instant::now());
     let mut show_seconds = use_signal(|| true);
     let mut system_snapshot = use_signal(|| None::<SystemSnapshot>);
+    let mut audio_snapshot = use_signal(|| None::<AudioSnapshot>);
+    let mut brightness_snapshot = use_signal(|| None::<BrightnessSnapshot>);
     let mut pressed_button = use_signal(|| None::<usize>);
     let mut monitor_num = use_signal(|| None::<i32>);
     let mut layout_symbol = use_signal(|| "[]=".to_string());
@@ -385,16 +567,10 @@ fn App() -> Element {
         SharedRingBuffer::create_shared_ring_buffer_aux(&shared_path).map(Arc::new)
     });
 
-    // 监视器图标
-    let monitor_icon = |num: i32| -> &'static str {
-        match num {
-            0 => "󰎡",
-            1 => "󰎤",
-            _ => "?",
-        }
-    };
+    let audio_manager = use_signal(|| Arc::new(Mutex::new(AudioManager::new())));
+    let brightness_manager = use_signal(|| Arc::new(Mutex::new(BrightnessManager::new())));
 
-    // 系统信息监控（保持原有逻辑）
+    // 系统信息
     use_effect(move || {
         spawn(async move {
             let (sys_sender, sys_receiver) = std::sync::mpsc::channel();
@@ -420,7 +596,50 @@ fn App() -> Element {
         });
     });
 
-    // 共享内存通信逻辑
+    // 音频 + 亮度刷新
+    use_effect(move || {
+        let am = audio_manager.read().clone();
+        let bm = brightness_manager.read().clone();
+        spawn(async move {
+            loop {
+                let new_audio = {
+                    let mut guard = am.lock().ok();
+                    if let Some(g) = guard.as_mut() {
+                        g.update_if_needed();
+                        Some(audio_snapshot_from(g))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(snap) = new_audio {
+                    let changed = audio_snapshot.read().as_ref() != Some(&snap);
+                    if changed {
+                        audio_snapshot.set(Some(snap));
+                    }
+                }
+
+                let new_brightness = {
+                    let mut guard = bm.lock().ok();
+                    if let Some(g) = guard.as_mut() {
+                        g.update_if_needed();
+                        Some(BrightnessSnapshot { percent: g.percent() })
+                    } else {
+                        None
+                    }
+                };
+                if let Some(snap) = new_brightness {
+                    let changed = brightness_snapshot.read().as_ref() != Some(&snap);
+                    if changed {
+                        brightness_snapshot.set(Some(snap));
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+        });
+    });
+
+    // 共享内存
     use_effect(move || {
         let (message_sender, mut message_receiver) =
             tokio::sync::mpsc::channel::<SharedMessage>(100);
@@ -431,15 +650,13 @@ fn App() -> Element {
         });
 
         spawn(async move {
-            // 异步等待消息，无需轮询
             while let Some(shared_message) = message_receiver.recv().await {
-                let mut new_states = vec![ButtonStateData::default(); BUTTONS.len()];
+                let mut new_states = vec![ButtonStateData::default(); TAG_ICONS.len()];
                 let monitor_info = shared_message.monitor_info;
 
                 layout_symbol.set(monitor_info.get_ltsymbol());
                 monitor_num.set(Some(monitor_info.monitor_num));
 
-                // 更新按钮状态
                 for (index, tag_status) in monitor_info.tag_status_vec.iter().enumerate() {
                     if index < new_states.len() {
                         new_states[index] = ButtonStateData {
@@ -450,8 +667,8 @@ fn App() -> Element {
                         };
                     }
                 }
-                let need_update_button_states = { *button_states.read() != new_states };
-                if need_update_button_states {
+                let need_update = { *button_states.read() != new_states };
+                if need_update {
                     button_states.set(new_states);
                     last_update.set(Instant::now());
                 }
@@ -459,7 +676,6 @@ fn App() -> Element {
         });
     });
 
-    // 按钮处理函数
     let mut handle_button_press = move |index: usize| {
         info!("Button {} pressed", index);
         pressed_button.set(Some(index));
@@ -481,7 +697,6 @@ fn App() -> Element {
         pressed_button.set(None);
     };
 
-    // 布局面板控制
     let toggle_layout_panel = move |_| {
         layout_open.set(!layout_open());
     };
@@ -503,8 +718,7 @@ fn App() -> Element {
         div { class: "button-row",
 
             div { class: "buttons-container",
-                // 工作区按钮（Tag）
-                for (i , emoji) in BUTTONS.iter().enumerate() {
+                for (i , icon) in TAG_ICONS.iter().enumerate() {
                     {
                         let base_class = get_button_class(i, &button_states());
                         let is_pressed = pressed_button() == Some(i);
@@ -517,6 +731,7 @@ fn App() -> Element {
                             button {
                                 key: "{i}",
                                 class: "{button_class}",
+                                title: "Tag {i + 1}",
                                 onmousedown: move |_| handle_button_press(i),
                                 onmouseup: move |_| handle_button_release(i),
                                 onmouseleave: move |_| handle_button_leave(i),
@@ -525,15 +740,14 @@ fn App() -> Element {
                                         handle_button_release(i);
                                     }
                                 },
-                                "{emoji}"
+                                span { class: "nf-icon", "{icon}" }
                             }
                         }
                     }
                 }
 
-                // 布局切换 + 选项（Pill）
+                // 布局切换
                 div { class: "layout-controls",
-                    // 开关按钮
                     {
                         let toggle_class = format!(
                             "pill layout-toggle {}",
@@ -544,7 +758,6 @@ fn App() -> Element {
                         }
                     }
 
-                    // 选项行（展开时）
                     if layout_open() {
                         {
                             let current = layout_symbol();
@@ -572,30 +785,35 @@ fn App() -> Element {
                 }
             }
 
-            // 中间撑开
             div { class: "spacer" }
 
-            // 右侧信息（Pill）
             div { class: "right-info-container",
                 SystemInfoDisplay { snapshot: system_snapshot() }
+                BrightnessControl {
+                    snapshot: brightness_snapshot(),
+                    brightness_manager,
+                }
+                VolumeControl {
+                    snapshot: audio_snapshot(),
+                    audio_manager,
+                }
                 ScreenshotButton {}
 
-                // 时间 pill（点击切换秒显示）
                 div {
                     class: "pill time-pill",
                     onclick: move |_| {
                         show_seconds.set(!show_seconds());
                         info!("Toggle seconds display: {}", show_seconds());
                     },
+                    span { class: "nf-icon", "{ICON_TIME}" }
                     TimeText { show_seconds: show_seconds() }
                 }
 
-                // Monitor 指示 pill
                 div { class: "pill monitor-pill",
-                    {format!("🖥️ {}", monitor_icon(monitor_num().unwrap_or(0)))}
+                    span { class: "nf-icon", "{ICON_MON}" }
+                    {format!("{}", monitor_icon_glyph(monitor_num().unwrap_or(0)))}
                 }
 
-                // Scale factor pill
                 div { class: "pill scale-pill", {format!("s: {:.2}", scale_factor())} }
             }
         }

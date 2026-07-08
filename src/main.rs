@@ -329,15 +329,6 @@ fn VolumeControl(
             }
         }
     };
-    let on_context = move |evt: Event<MouseData>| {
-        evt.prevent_default();
-        let am = audio_manager.read().clone();
-        if let Ok(mut am) = am.lock() {
-            if let Some(dev) = am.get_master_device().cloned() {
-                let _ = am.adjust_volume(&dev.name, -5);
-            }
-        }
-    };
     let on_wheel = move |evt: Event<WheelData>| {
         evt.prevent_default();
         let dy = evt.data().delta().strip_units().y;
@@ -354,9 +345,8 @@ fn VolumeControl(
         div {
             class: "{cls}",
             onclick: on_click,
-            oncontextmenu: on_context,
             onwheel: on_wheel,
-            title: "左键静音 / 滚轮调节 / 右键 -5",
+            title: "左键静音 / 滚轮调节",
             span { class: "nf-icon", "{icon}" }
             "{label}"
         }

@@ -1,24 +1,31 @@
-use chrono::Local;
 use dioxus::{
-    desktop::{Config, LogicalPosition, WindowBuilder, use_window},
+    desktop::{
+        Config, DesktopContext, LogicalPosition, LogicalSize, WindowBuilder,
+        tao::dpi::{PhysicalPosition, PhysicalSize},
+        use_window,
+    },
     prelude::*,
 };
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::{
     env,
     process::Command,
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
-use shared_structures::{CommandType, SharedCommand, SharedMessage, SharedRingBuffer};
-use xbar_core::initialize_logging;
-use xbar_core::system_monitor::SystemMonitor;
-use xbar_core::system_monitor::SystemSnapshot;
-use xbar_core::{AudioManager, BrightnessManager};
+use xbar_core::logging::init as initialize_logging;
+use xbar_core::{
+    AudioDeviceInfo, BarEffect, BarRuntime, BarSnapshot, LayoutId, ModelConfig, MonitorGeometry,
+    Percent, RuntimeAdapter, RuntimeIssue, RuntimeUpdate, SharedTransport, SystemDetails, TagId,
+    TagState, UserAction,
+};
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
+const BAR_LOGICAL_HEIGHT: f64 = 40.0;
+const TRANSPORT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TRANSPORT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 
 // ===== Nerd Font 图标（与 tauri_react_bar 对齐） =====
 const TAG_ICONS: &[&str] = &[
@@ -54,106 +61,176 @@ fn monitor_icon_glyph(num: i32) -> &'static str {
     }
 }
 
-fn volume_icon(snap: Option<&AudioSnapshot>) -> &'static str {
+fn volume_icon(snap: Option<&AudioDeviceInfo>) -> &'static str {
     match snap {
         None => ICON_VOL_MUTE,
-        Some(s) if !s.has_device || s.is_muted || s.volume <= 0 => ICON_VOL_MUTE,
+        Some(s) if s.is_muted || s.volume <= 0 => ICON_VOL_MUTE,
         Some(s) if s.volume < 34 => ICON_VOL_LOW,
         Some(s) if s.volume < 67 => ICON_VOL_MID,
         Some(_) => ICON_VOL_HIGH,
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
-struct AudioSnapshot {
-    volume: i32,
-    is_muted: bool,
-    has_device: bool,
+struct RuntimeOwner {
+    runtime: BarRuntime,
+    shared_path: String,
+    last_transport_retry: Instant,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-struct BrightnessSnapshot {
-    percent: Option<u8>,
-}
+impl RuntimeOwner {
+    fn new(shared_path: String) -> Self {
+        let transport = if shared_path.is_empty() {
+            None
+        } else {
+            match SharedTransport::open(&shared_path) {
+                Ok(transport) => Some(transport),
+                Err(error) => {
+                    warn!("failed to open WM transport at {shared_path:?}: {error}");
+                    None
+                }
+            }
+        };
+        let runtime = BarRuntime::with_transport(
+            ModelConfig {
+                show_seconds: true,
+                ..ModelConfig::default()
+            },
+            transport,
+        )
+        .expect("dioxus bar model configuration is valid");
 
-fn audio_snapshot_from(am: &AudioManager) -> AudioSnapshot {
-    if let Some(d) = am.get_master_device() {
-        AudioSnapshot {
-            volume: d.volume.clamp(0, 100),
-            is_muted: d.is_muted,
-            has_device: true,
-        }
-    } else {
-        AudioSnapshot {
-            volume: 0,
-            is_muted: true,
-            has_device: false,
+        Self {
+            runtime,
+            shared_path,
+            last_transport_retry: Instant::now(),
         }
     }
-}
 
-fn shared_memory_worker(
-    shared_buffer_opt: Option<Arc<SharedRingBuffer>>,
-    message_sender: tokio::sync::mpsc::Sender<SharedMessage>,
-) {
-    info!("Starting shared memory worker thread");
-    let mut prev_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    if let Some(shared_buffer) = shared_buffer_opt {
-        loop {
-            match shared_buffer.wait_for_message(Some(Duration::from_secs(2))) {
-                Ok(true) => {
-                    if let Ok(Some(message)) = shared_buffer.try_read_latest_message() {
-                        if prev_timestamp != message.timestamp as u128 {
-                            prev_timestamp = message.timestamp as u128;
-                            if let Err(e) = message_sender.blocking_send(message) {
-                                error!("Failed to send message: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Ok(false) => debug!("[notifier] Wait for message timed out."),
-                Err(e) => {
-                    error!("[notifier] Wait for message failed: {}", e);
-                    break;
-                }
+    fn snapshot(&self) -> BarSnapshot {
+        self.runtime.snapshot()
+    }
+
+    fn tick(&mut self) -> (RuntimeUpdate, BarSnapshot) {
+        let update = self.runtime.tick();
+        self.disconnect_failed_transport(&update);
+        (update, self.runtime.snapshot())
+    }
+
+    fn poll_transport(&mut self) -> (RuntimeUpdate, BarSnapshot) {
+        self.reconnect_transport_if_due();
+        let update = self.runtime.poll_transport();
+        self.disconnect_failed_transport(&update);
+        (update, self.runtime.snapshot())
+    }
+
+    fn dispatch(&mut self, action: UserAction) -> (RuntimeUpdate, BarSnapshot) {
+        let update = self.runtime.dispatch(action);
+        self.disconnect_failed_transport(&update);
+        (update, self.runtime.snapshot())
+    }
+
+    fn reconnect_transport_if_due(&mut self) {
+        if self.shared_path.is_empty()
+            || self.runtime.transport().is_some()
+            || self.last_transport_retry.elapsed() < TRANSPORT_RETRY_INTERVAL
+        {
+            return;
+        }
+
+        self.last_transport_retry = Instant::now();
+        match SharedTransport::open(&self.shared_path) {
+            Ok(transport) => {
+                self.runtime.set_transport(Some(transport));
+                info!("reconnected WM transport at {:?}", self.shared_path);
+            }
+            Err(error) => {
+                warn!(
+                    "failed to reconnect WM transport at {:?}: {error}",
+                    self.shared_path
+                );
             }
         }
     }
-    info!("Shared memory worker task exiting");
-}
 
-fn send_tag_command(
-    shared_buffer: &SharedRingBuffer,
-    monitor_id: i32,
-    active_tab: usize,
-    is_view: bool,
-) {
-    let tag_bit = 1 << active_tab;
-    the_cmd_send(
-        shared_buffer,
-        if is_view {
-            SharedCommand::view_tag(tag_bit, monitor_id)
-        } else {
-            SharedCommand::toggle_tag(tag_bit, monitor_id)
-        },
-    );
-}
-
-fn the_cmd_send(shared_buffer: &SharedRingBuffer, cmd: SharedCommand) {
-    match shared_buffer.send_command(cmd) {
-        Ok(true) => info!("Sent command: by shared_buffer"),
-        Ok(false) => warn!("Command buffer full, command dropped"),
-        Err(e) => error!("Failed to send command: {}", e),
+    fn disconnect_failed_transport(&mut self, update: &RuntimeUpdate) {
+        let transport_failed = update.issues.iter().any(|issue| {
+            matches!(
+                issue,
+                RuntimeIssue::AdapterFailed {
+                    adapter: RuntimeAdapter::Transport,
+                    ..
+                }
+            )
+        });
+        if transport_failed {
+            self.runtime.set_transport(None);
+            self.last_transport_retry = Instant::now();
+        }
     }
 }
 
-fn send_layout_command(shared_buffer: &SharedRingBuffer, monitor_id: i32, layout_index: u32) {
-    let cmd = SharedCommand::new(CommandType::SetLayout, layout_index, monitor_id);
-    the_cmd_send(shared_buffer, cmd);
+fn apply_monitor_geometry(geometry: MonitorGeometry, window: &DesktopContext) {
+    let physical_height = (window.scale_factor() * BAR_LOGICAL_HEIGHT)
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
+    window.set_outer_position(PhysicalPosition::new(geometry.x, geometry.y));
+    window.set_inner_size(PhysicalSize::new(geometry.width, physical_height));
+}
+
+#[derive(Clone, Copy)]
+struct WindowBaseline {
+    position: Option<PhysicalPosition<i32>>,
+    logical_size: LogicalSize<f64>,
+}
+
+fn restore_window_baseline(baseline: WindowBaseline, window: &DesktopContext) {
+    if let Some(position) = baseline.position {
+        window.set_outer_position(position);
+    }
+    let physical_size = baseline
+        .logical_size
+        .to_physical::<u32>(window.scale_factor());
+    window.set_inner_size(PhysicalSize::new(
+        physical_size.width.max(1),
+        physical_size.height.max(1),
+    ));
+}
+
+fn spawn_and_reap(program: &'static str, args: &'static [&'static str]) {
+    let thread_name = format!("dioxus-bar-{program}");
+    if let Err(error) = thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || match Command::new(program).args(args).status() {
+            Ok(status) if !status.success() => {
+                warn!("{program} exited with status {status}");
+            }
+            Ok(_) => {}
+            Err(error) => warn!("failed to start {program}: {error}"),
+        })
+    {
+        warn!("failed to start {program} waiter thread: {error}");
+    }
+}
+
+fn handle_runtime_update(update: RuntimeUpdate, window: &DesktopContext, baseline: WindowBaseline) {
+    for issue in update.issues {
+        warn!("xbar runtime issue: {issue:?}");
+    }
+    for effect in update.platform_effects {
+        match effect {
+            BarEffect::ApplyMonitorGeometry(geometry) => {
+                apply_monitor_geometry(geometry, window);
+            }
+            BarEffect::ClearMonitorGeometry => restore_window_baseline(baseline, window),
+            BarEffect::Screenshot => {
+                spawn_and_reap("flameshot", &["gui"]);
+            }
+            BarEffect::OpenAudioControl => {
+                spawn_and_reap("pavucontrol", &[]);
+            }
+            unhandled => warn!("unhandled xbar platform effect: {unhandled:?}"),
+        }
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -173,40 +250,11 @@ fn format_bytes(bytes: u64) -> String {
 
 // 截图按钮
 #[component]
-fn ScreenshotButton() -> Element {
-    let mut is_taking_screenshot = use_signal(|| false);
-
-    let take_screenshot = move |_| {
-        if is_taking_screenshot() {
-            return;
-        }
-        is_taking_screenshot.set(true);
-        info!("Taking screenshot with flameshot");
-        spawn(async move {
-            let result =
-                tokio::task::spawn_blocking(|| Command::new("flameshot").arg("gui").spawn()).await;
-            match result {
-                Ok(Ok(mut child)) => {
-                    info!("Flameshot launched successfully");
-                    let _ = tokio::task::spawn_blocking(move || child.wait()).await;
-                }
-                Ok(Err(e)) => error!("Failed to launch flameshot: {}", e),
-                Err(e) => error!("Task error when launching flameshot: {}", e),
-            }
-            is_taking_screenshot.set(false);
-        });
-    };
-
-    let cls = if is_taking_screenshot() {
-        "pill screenshot-pill taking"
-    } else {
-        "pill screenshot-pill"
-    };
-
+fn ScreenshotButton(on_action: EventHandler<UserAction>) -> Element {
     rsx! {
         div {
-            class: "{cls}",
-            onclick: take_screenshot,
+            class: "pill screenshot-pill",
+            onclick: move |_| on_action.call(UserAction::Screenshot),
             title: "截图 (Flameshot)",
             span { class: "nf-icon", "{ICON_SHOT}" }
         }
@@ -215,7 +263,11 @@ fn ScreenshotButton() -> Element {
 
 // 系统信息（CPU/MEM/电池）
 #[component]
-fn SystemInfoDisplay(snapshot: Option<SystemSnapshot>) -> Element {
+fn SystemInfoDisplay(
+    snapshot: Option<SystemDetails>,
+    battery_percent: Option<u8>,
+    is_charging: bool,
+) -> Element {
     let sev = |p: f32| {
         if p <= 30.0 {
             "usage-good"
@@ -229,11 +281,12 @@ fn SystemInfoDisplay(snapshot: Option<SystemSnapshot>) -> Element {
     };
 
     if let Some(ref s) = snapshot {
-        let cpu_class = sev(s.cpu_average as f32);
-        let mem_class = sev(s.memory_usage_percent as f32);
-        let batt_class = if s.battery_percent > 50.0 {
+        let battery_percent = battery_percent.map(f32::from).unwrap_or(100.0);
+        let cpu_class = sev(s.cpu_average);
+        let mem_class = sev(s.memory_usage_percent);
+        let batt_class = if battery_percent > 50.0 {
             "usage-good"
-        } else if s.battery_percent > 20.0 {
+        } else if battery_percent > 20.0 {
             "usage-warn"
         } else {
             "usage-danger"
@@ -248,15 +301,19 @@ fn SystemInfoDisplay(snapshot: Option<SystemSnapshot>) -> Element {
             format_bytes(s.memory_used),
             format_bytes(s.memory_total)
         );
-        let batt_title = if s.is_charging {
-            format!("电池充电中: {:.1}%", s.battery_percent)
+        let batt_title = if is_charging {
+            format!("电池充电中: {:.1}%", battery_percent)
         } else {
-            format!("电池电量: {:.1}%", s.battery_percent)
+            format!("电池电量: {:.1}%", battery_percent)
         };
-        let batt_icon = if s.is_charging { ICON_BAT_CHG } else { ICON_BAT_FULL };
+        let batt_icon = if is_charging {
+            ICON_BAT_CHG
+        } else {
+            ICON_BAT_FULL
+        };
         let cpu_text = format!("{:.0}%", s.cpu_average);
         let mem_text = format!("{:.0}%", s.memory_usage_percent);
-        let batt_text = format!("{:.0}%", s.battery_percent);
+        let batt_text = format!("{:.0}%", battery_percent);
 
         rsx! {
             div { class: "system-info-container",
@@ -297,15 +354,12 @@ fn SystemInfoDisplay(snapshot: Option<SystemSnapshot>) -> Element {
 // 音量控制
 #[component]
 fn VolumeControl(
-    snapshot: Option<AudioSnapshot>,
-    audio_manager: Signal<Arc<Mutex<AudioManager>>>,
+    snapshot: Option<AudioDeviceInfo>,
+    on_action: EventHandler<UserAction>,
 ) -> Element {
     let snap = snapshot.clone();
-    let muted = snap
-        .as_ref()
-        .map(|s| s.is_muted || !s.has_device)
-        .unwrap_or(true);
-    let has_device = snap.as_ref().map(|s| s.has_device).unwrap_or(false);
+    let muted = snap.as_ref().map(|s| s.is_muted).unwrap_or(true);
+    let has_device = snap.is_some();
     let vol = snap.as_ref().map(|s| s.volume).unwrap_or(0);
     let icon = volume_icon(snap.as_ref());
     let label = if has_device {
@@ -320,25 +374,17 @@ fn VolumeControl(
     };
 
     let on_click = move |_| {
-        let am = audio_manager.read().clone();
-        if let Ok(mut am) = am.lock() {
-            if let Some(dev) = am.get_master_device().cloned() {
-                if let Err(e) = am.toggle_mute(&dev.name) {
-                    warn!("toggle_mute failed: {}", e);
-                }
-            }
-        }
+        on_action.call(UserAction::ToggleMute);
     };
     let on_wheel = move |evt: Event<WheelData>| {
         evt.prevent_default();
         let dy = evt.data().delta().strip_units().y;
-        let delta = if dy < 0.0 { 5 } else { -5 };
-        let am = audio_manager.read().clone();
-        if let Ok(mut am) = am.lock() {
-            if let Some(dev) = am.get_master_device().cloned() {
-                let _ = am.adjust_volume(&dev.name, delta);
-            }
-        }
+        let action = if dy < 0.0 {
+            UserAction::VolumeUp
+        } else {
+            UserAction::VolumeDown
+        };
+        on_action.call(action);
     };
 
     rsx! {
@@ -355,37 +401,28 @@ fn VolumeControl(
 
 // 亮度控制
 #[component]
-fn BrightnessControl(
-    snapshot: Option<BrightnessSnapshot>,
-    brightness_manager: Signal<Arc<Mutex<BrightnessManager>>>,
-) -> Element {
-    let pct = snapshot.as_ref().and_then(|s| s.percent);
-    let label = match pct {
-        Some(p) => format!("{}%", p),
+fn BrightnessControl(percent: Option<Percent>, on_action: EventHandler<UserAction>) -> Element {
+    let label = match percent {
+        Some(value) => format!("{}%", value.rounded()),
         None => "--".to_string(),
     };
 
     let on_click = move |_| {
-        let bm = brightness_manager.read().clone();
-        if let Ok(mut bm) = bm.lock() {
-            bm.adjust(5);
-        }
+        on_action.call(UserAction::BrightnessUp);
     };
     let on_context = move |evt: Event<MouseData>| {
         evt.prevent_default();
-        let bm = brightness_manager.read().clone();
-        if let Ok(mut bm) = bm.lock() {
-            bm.adjust(-5);
-        }
+        on_action.call(UserAction::BrightnessDown);
     };
     let on_wheel = move |evt: Event<WheelData>| {
         evt.prevent_default();
         let dy = evt.data().delta().strip_units().y;
-        let delta = if dy < 0.0 { 5 } else { -5 };
-        let bm = brightness_manager.read().clone();
-        if let Ok(mut bm) = bm.lock() {
-            bm.adjust(delta);
-        }
+        let action = if dy < 0.0 {
+            UserAction::BrightnessUp
+        } else {
+            UserAction::BrightnessDown
+        };
+        on_action.call(action);
     };
 
     rsx! {
@@ -398,37 +435,6 @@ fn BrightnessControl(
             span { class: "nf-icon", "{ICON_BRIGHT}" }
             "{label}"
         }
-    }
-}
-
-// 时间文本
-#[component]
-fn TimeText(show_seconds: bool) -> Element {
-    let mut current_time = use_signal(|| Local::now());
-
-    use_effect(move || {
-        spawn(async move {
-            loop {
-                let update_interval = if show_seconds {
-                    Duration::from_millis(1000)
-                } else {
-                    Duration::from_millis(60000)
-                };
-                tokio::time::sleep(update_interval).await;
-                current_time.set(Local::now());
-            }
-        });
-    });
-
-    let time_format = if show_seconds {
-        "%Y-%m-%d %H:%M:%S"
-    } else {
-        "%Y-%m-%d %H:%M"
-    };
-    let time_str = current_time().format(time_format).to_string();
-
-    rsx! {
-        span { "{time_str}" }
     }
 }
 
@@ -467,31 +473,24 @@ impl ButtonState {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-struct ButtonStateData {
-    is_filtered: bool,
-    is_selected: bool,
-    is_urg: bool,
-    is_occ: bool,
+fn get_button_class(index: usize, tags: &[TagState]) -> &'static str {
+    tags.get(index)
+        .map(|tag| {
+            ButtonState::from_flags(tag.filled, tag.selected, tag.urgent, tag.occupied)
+                .to_css_class()
+        })
+        .unwrap_or("emoji-button state-default")
 }
 
-impl ButtonStateData {
-    fn get_state(&self) -> ButtonState {
-        ButtonState::from_flags(self.is_filtered, self.is_selected, self.is_urg, self.is_occ)
-    }
-}
-
-fn get_button_class(index: usize, button_states: &[ButtonStateData]) -> &'static str {
-    if index < button_states.len() {
-        button_states[index].get_state().to_css_class()
-    } else {
-        "emoji-button state-default"
-    }
+fn shared_path_from_environment() -> String {
+    env::args()
+        .nth(1)
+        .or_else(|| env::var("SHARED_MEMORY_PATH").ok())
+        .unwrap_or_default()
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let shared_path = args.get(1).cloned().unwrap_or_default();
+    let shared_path = shared_path_from_environment();
     if let Err(e) = initialize_logging("dioxus_bar", &shared_path) {
         error!("Failed to initialize logging: {}", e);
         std::process::exit(1);
@@ -518,6 +517,7 @@ fn main() {
                 WindowBuilder::new()
                     .with_title("dioxus_bar")
                     .with_position(LogicalPosition::new(0, 0))
+                    .with_inner_size(LogicalSize::new(800.0, BAR_LOGICAL_HEIGHT))
                     .with_maximizable(false)
                     .with_minimizable(false)
                     .with_resizable(true)
@@ -531,140 +531,120 @@ fn main() {
 
 #[component]
 fn App() -> Element {
-    let shared_path = std::env::args().nth(1).unwrap_or_else(|| {
-        std::env::var("SHARED_MEMORY_PATH").unwrap_or_else(|_| "/dev/shm/monitor_0".to_string())
-    });
+    let shared_path = shared_path_from_environment();
 
     let window = use_window();
-    let scale_factor = use_signal(|| window.scale_factor());
-
-    let mut button_states = use_signal(|| vec![ButtonStateData::default(); TAG_ICONS.len()]);
-    let mut last_update = use_signal(|| Instant::now());
-    let mut show_seconds = use_signal(|| true);
-    let mut system_snapshot = use_signal(|| None::<SystemSnapshot>);
-    let mut audio_snapshot = use_signal(|| None::<AudioSnapshot>);
-    let mut brightness_snapshot = use_signal(|| None::<BrightnessSnapshot>);
+    let window_baseline = {
+        let window = window.clone();
+        use_hook(move || WindowBaseline {
+            position: window.outer_position().ok(),
+            logical_size: window.inner_size().to_logical::<f64>(window.scale_factor()),
+        })
+    };
+    let mut scale_factor = use_signal(|| window.scale_factor());
     let mut pressed_button = use_signal(|| None::<usize>);
-    let mut monitor_num = use_signal(|| None::<i32>);
-    let mut layout_symbol = use_signal(|| "[]=".to_string());
-    let mut layout_open = use_signal(|| false);
-
-    let shared_buffer_sig = use_signal(|| {
-        info!(
-            "(SIGNAL-INIT) Creating shared ring buffer for path: {}",
-            shared_path
-        );
-        SharedRingBuffer::create_shared_ring_buffer_aux(&shared_path).map(Arc::new)
+    let runtime = use_signal(move || Arc::new(Mutex::new(RuntimeOwner::new(shared_path))));
+    let initial_runtime = runtime.read().clone();
+    let mut bar_snapshot = use_signal(move || {
+        initial_runtime
+            .lock()
+            .expect("new dioxus bar runtime mutex is healthy")
+            .snapshot()
     });
 
-    let audio_manager = use_signal(|| Arc::new(Mutex::new(AudioManager::new())));
-    let brightness_manager = use_signal(|| Arc::new(Mutex::new(BrightnessManager::new())));
-
-    // 系统信息
-    use_effect(move || {
-        spawn(async move {
-            let (sys_sender, sys_receiver) = std::sync::mpsc::channel();
-            thread::spawn(move || {
-                let mut monitor = SystemMonitor::new(30);
-                monitor.set_update_interval(Duration::from_millis(2000));
+    // Core owns every provider and the clock. Only its owned projection
+    // crosses into Dioxus reactive state.
+    use_effect({
+        let runtime = runtime.read().clone();
+        let window = window.clone();
+        move || {
+            let runtime = Arc::clone(&runtime);
+            let window = window.clone();
+            let mut observed_scale_factor = window.scale_factor();
+            spawn(async move {
                 loop {
-                    monitor.update_if_needed();
-                    if let Some(snapshot) = monitor.get_snapshot() {
-                        if sys_sender.send(snapshot.clone()).is_err() {
-                            break;
+                    let result = runtime.lock().ok().map(|mut runtime| runtime.tick());
+                    if let Some((update, snapshot)) = result {
+                        handle_runtime_update(update, &window, window_baseline);
+
+                        let current_scale_factor = window.scale_factor();
+                        if current_scale_factor.to_bits() != observed_scale_factor.to_bits() {
+                            observed_scale_factor = current_scale_factor;
+                            scale_factor.set(current_scale_factor);
+                            snapshot.geometry.map_or_else(
+                                || restore_window_baseline(window_baseline, &window),
+                                |geometry| apply_monitor_geometry(geometry, &window),
+                            );
                         }
+
+                        bar_snapshot.set(snapshot);
+                    } else {
+                        error!("xbar runtime mutex was poisoned");
                     }
-                    thread::sleep(Duration::from_millis(500));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             });
-            loop {
-                if let Ok(snapshot) = sys_receiver.try_recv() {
-                    system_snapshot.set(Some(snapshot));
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        });
+        }
     });
 
-    // 音频 + 亮度刷新
-    use_effect(move || {
-        let am = audio_manager.read().clone();
-        let bm = brightness_manager.read().clone();
-        spawn(async move {
-            loop {
-                let new_audio = {
-                    let mut guard = am.lock().ok();
-                    if let Some(g) = guard.as_mut() {
-                        g.update_if_needed();
-                        Some(audio_snapshot_from(g))
+    // Polling is nonblocking. It also keeps the transport lifecycle in this
+    // owner, so a replaced shared-memory endpoint is rediscovered promptly.
+    use_effect({
+        let runtime = runtime.read().clone();
+        let window = window.clone();
+        move || {
+            let runtime = Arc::clone(&runtime);
+            let window = window.clone();
+            spawn(async move {
+                loop {
+                    let result = runtime
+                        .lock()
+                        .ok()
+                        .map(|mut runtime| runtime.poll_transport());
+                    if let Some((update, snapshot)) = result {
+                        let needs_redraw = update.needs_redraw();
+                        handle_runtime_update(update, &window, window_baseline);
+                        if needs_redraw {
+                            bar_snapshot.set(snapshot);
+                        }
                     } else {
-                        None
+                        error!("xbar runtime mutex was poisoned");
                     }
-                };
-                if let Some(snap) = new_audio {
-                    let changed = audio_snapshot.read().as_ref() != Some(&snap);
-                    if changed {
-                        audio_snapshot.set(Some(snap));
-                    }
+                    tokio::time::sleep(TRANSPORT_POLL_INTERVAL).await;
                 }
-
-                let new_brightness = {
-                    let mut guard = bm.lock().ok();
-                    if let Some(g) = guard.as_mut() {
-                        g.update_if_needed();
-                        Some(BrightnessSnapshot { percent: g.percent() })
-                    } else {
-                        None
-                    }
-                };
-                if let Some(snap) = new_brightness {
-                    let changed = brightness_snapshot.read().as_ref() != Some(&snap);
-                    if changed {
-                        brightness_snapshot.set(Some(snap));
-                    }
-                }
-
-                tokio::time::sleep(Duration::from_millis(750)).await;
-            }
-        });
+            });
+        }
     });
 
-    // 共享内存
-    use_effect(move || {
-        let (message_sender, mut message_receiver) =
-            tokio::sync::mpsc::channel::<SharedMessage>(100);
-        info!("Using shared memory path: {}", shared_path);
-        let shared_buffer_for_worker = shared_buffer_sig.read().clone();
-        thread::spawn(move || {
-            shared_memory_worker(shared_buffer_for_worker, message_sender);
-        });
-
-        spawn(async move {
-            while let Some(shared_message) = message_receiver.recv().await {
-                let mut new_states = vec![ButtonStateData::default(); TAG_ICONS.len()];
-                let monitor_info = shared_message.monitor_info;
-
-                layout_symbol.set(monitor_info.get_ltsymbol());
-                monitor_num.set(Some(monitor_info.monitor_num));
-
-                for (index, tag_status) in monitor_info.tag_status_vec.iter().enumerate() {
-                    if index < new_states.len() {
-                        new_states[index] = ButtonStateData {
-                            is_filtered: tag_status.is_filled,
-                            is_selected: tag_status.is_selected,
-                            is_urg: tag_status.is_urg,
-                            is_occ: tag_status.is_occ,
-                        };
-                    }
-                }
-                let need_update = { *button_states.read() != new_states };
-                if need_update {
-                    button_states.set(new_states);
-                    last_update.set(Instant::now());
-                }
+    let dispatch_action = {
+        let runtime = runtime.read().clone();
+        let window = window.clone();
+        use_callback(move |action: UserAction| {
+            let result = runtime
+                .lock()
+                .ok()
+                .map(|mut runtime| runtime.dispatch(action));
+            if let Some((update, snapshot)) = result {
+                handle_runtime_update(update, &window, window_baseline);
+                bar_snapshot.set(snapshot);
+            } else {
+                error!("xbar runtime mutex was poisoned");
             }
-        });
-    });
+        })
+    };
+
+    let state = bar_snapshot();
+    let wm_available = state.wm_available;
+    let wm_tags = if state.wm_available {
+        state.tags.as_slice()
+    } else {
+        &[]
+    };
+    let layout_symbol = if state.wm_available {
+        state.layout_symbol.as_str()
+    } else {
+        "[]="
+    };
 
     let mut handle_button_press = move |index: usize| {
         info!("Button {} pressed", index);
@@ -674,12 +654,8 @@ fn App() -> Element {
     let mut handle_button_release = move |index: usize| {
         info!("Button {} released", index);
         pressed_button.set(None);
-        if let (Some(monitor_id), Some(buffer_arc)) =
-            (monitor_num(), shared_buffer_sig.read().as_ref())
-        {
-            send_tag_command(buffer_arc, monitor_id, index, true);
-        } else {
-            warn!("Shared buffer or monitor_num not available, cannot send command.");
+        if wm_available && let Some(tag) = TagId::new(index) {
+            dispatch_action.call(UserAction::ViewTag(tag));
         }
     };
 
@@ -688,17 +664,12 @@ fn App() -> Element {
     };
 
     let toggle_layout_panel = move |_| {
-        layout_open.set(!layout_open());
+        dispatch_action.call(UserAction::ToggleLayoutSelector);
     };
 
-    let mut select_layout = move |idx: u32| {
-        layout_open.set(false);
-        if let (Some(monitor_id), Some(buffer_arc)) =
-            (monitor_num(), shared_buffer_sig.read().as_ref())
-        {
-            send_layout_command(buffer_arc, monitor_id, idx);
-        } else {
-            warn!("Shared buffer or monitor_num not available for layout set.");
+    let select_layout = move |index: u32| {
+        if wm_available {
+            dispatch_action.call(UserAction::SetLayout(LayoutId(index)));
         }
     };
 
@@ -706,11 +677,10 @@ fn App() -> Element {
         document::Style { "{STYLE_CSS}" }
 
         div { class: "button-row",
-
             div { class: "buttons-container",
                 for (i , icon) in TAG_ICONS.iter().enumerate() {
                     {
-                        let base_class = get_button_class(i, &button_states());
+                        let base_class = get_button_class(i, wm_tags);
                         let is_pressed = pressed_button() == Some(i);
                         let button_class = if is_pressed {
                             format!("{} pressed", base_class)
@@ -736,32 +706,30 @@ fn App() -> Element {
                     }
                 }
 
-                // 布局切换
                 div { class: "layout-controls",
                     {
                         let toggle_class = format!(
                             "pill layout-toggle {}",
-                            if layout_open() { "open" } else { "closed" },
+                            if state.layout_selector_open { "open" } else { "closed" },
                         );
                         rsx! {
-                            div { class: "{toggle_class}", onclick: toggle_layout_panel, "{layout_symbol()}" }
+                            div { class: "{toggle_class}", onclick: toggle_layout_panel, "{layout_symbol}" }
                         }
                     }
 
-                    if layout_open() {
+                    if state.layout_selector_open {
                         {
-                            let current = layout_symbol();
                             let lo0 = format!(
                                 "pill layout-option {}",
-                                if current.contains("[]=") { "current" } else { "" },
+                                if layout_symbol.contains("[]=") { "current" } else { "" },
                             );
                             let lo1 = format!(
                                 "pill layout-option {}",
-                                if current.contains("><>") { "current" } else { "" },
+                                if layout_symbol.contains("><>") { "current" } else { "" },
                             );
                             let lo2 = format!(
                                 "pill layout-option {}",
-                                if current.contains("[M]") { "current" } else { "" },
+                                if layout_symbol.contains("[M]") { "current" } else { "" },
                             );
                             rsx! {
                                 div { class: "layout-selector",
@@ -778,30 +746,31 @@ fn App() -> Element {
             div { class: "spacer" }
 
             div { class: "right-info-container",
-                SystemInfoDisplay { snapshot: system_snapshot() }
+                SystemInfoDisplay {
+                    snapshot: state.system.cpu_percent.is_some().then(|| state.system_details.clone()),
+                    battery_percent: state.battery.percent.map(|value| value.rounded()),
+                    is_charging: state.battery.charging,
+                }
                 BrightnessControl {
-                    snapshot: brightness_snapshot(),
-                    brightness_manager,
+                    percent: state.brightness.percent,
+                    on_action: move |action| dispatch_action.call(action),
                 }
                 VolumeControl {
-                    snapshot: audio_snapshot(),
-                    audio_manager,
+                    snapshot: state.audio_device.clone(),
+                    on_action: move |action| dispatch_action.call(action),
                 }
-                ScreenshotButton {}
+                ScreenshotButton { on_action: move |action| dispatch_action.call(action) }
 
                 div {
                     class: "pill time-pill",
-                    onclick: move |_| {
-                        show_seconds.set(!show_seconds());
-                        info!("Toggle seconds display: {}", show_seconds());
-                    },
+                    onclick: move |_| dispatch_action.call(UserAction::ToggleSeconds),
                     span { class: "nf-icon", "{ICON_TIME}" }
-                    TimeText { show_seconds: show_seconds() }
+                    span { "{state.time}" }
                 }
 
                 div { class: "pill monitor-pill",
                     span { class: "nf-icon", "{ICON_MON}" }
-                    {format!("{}", monitor_icon_glyph(monitor_num().unwrap_or(0)))}
+                    {monitor_icon_glyph(state.monitor.0).to_string()}
                 }
 
                 div { class: "pill scale-pill", {format!("s: {:.2}", scale_factor())} }

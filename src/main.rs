@@ -10,17 +10,17 @@ use log::{error, info, warn};
 use std::{
     env,
     process::Command,
-    sync::{Arc, Mutex},
-    thread,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 
 use xbar_core::logging::init as initialize_logging;
 use xbar_core::{
     AudioDeviceInfo, BarEffect, BarRuntime, BarSnapshot, LayoutId, ModelConfig, MonitorGeometry,
-    Percent, RuntimeAdapter, RuntimeIssue, RuntimeUpdate, SharedTransport, SystemDetails, TagId,
-    TagState, UserAction,
+    Percent, PlatformEffectHandler, RuntimeUpdate, SystemDetails, TagId, TagState,
+    TransportRecoveryConfig, UserAction,
 };
+use xbar_linux_actions::ProcessActionHandler;
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const BAR_LOGICAL_HEIGHT: f64 = 40.0;
@@ -73,37 +73,24 @@ fn volume_icon(snap: Option<&AudioDeviceInfo>) -> &'static str {
 
 struct RuntimeOwner {
     runtime: BarRuntime,
-    shared_path: String,
-    last_transport_retry: Instant,
 }
 
 impl RuntimeOwner {
     fn new(shared_path: String) -> Self {
-        let transport = if shared_path.is_empty() {
-            None
-        } else {
-            match SharedTransport::open(&shared_path) {
-                Ok(transport) => Some(transport),
-                Err(error) => {
-                    warn!("failed to open WM transport at {shared_path:?}: {error}");
-                    None
-                }
-            }
+        let config = ModelConfig {
+            show_seconds: true,
+            ..ModelConfig::default()
         };
-        let runtime = BarRuntime::with_transport(
-            ModelConfig {
-                show_seconds: true,
-                ..ModelConfig::default()
-            },
-            transport,
-        )
+        let runtime = if shared_path.is_empty() {
+            BarRuntime::new(config)
+        } else {
+            let recovery = TransportRecoveryConfig::new(shared_path, TRANSPORT_RETRY_INTERVAL)
+                .expect("static transport recovery config is valid");
+            BarRuntime::with_managed_transport(config, recovery)
+        }
         .expect("dioxus bar model configuration is valid");
 
-        Self {
-            runtime,
-            shared_path,
-            last_transport_retry: Instant::now(),
-        }
+        Self { runtime }
     }
 
     fn snapshot(&self) -> BarSnapshot {
@@ -112,60 +99,17 @@ impl RuntimeOwner {
 
     fn tick(&mut self) -> (RuntimeUpdate, BarSnapshot) {
         let update = self.runtime.tick();
-        self.disconnect_failed_transport(&update);
         (update, self.runtime.snapshot())
     }
 
     fn poll_transport(&mut self) -> (RuntimeUpdate, BarSnapshot) {
-        self.reconnect_transport_if_due();
         let update = self.runtime.poll_transport();
-        self.disconnect_failed_transport(&update);
         (update, self.runtime.snapshot())
     }
 
     fn dispatch(&mut self, action: UserAction) -> (RuntimeUpdate, BarSnapshot) {
         let update = self.runtime.dispatch(action);
-        self.disconnect_failed_transport(&update);
         (update, self.runtime.snapshot())
-    }
-
-    fn reconnect_transport_if_due(&mut self) {
-        if self.shared_path.is_empty()
-            || self.runtime.transport().is_some()
-            || self.last_transport_retry.elapsed() < TRANSPORT_RETRY_INTERVAL
-        {
-            return;
-        }
-
-        self.last_transport_retry = Instant::now();
-        match SharedTransport::open(&self.shared_path) {
-            Ok(transport) => {
-                self.runtime.set_transport(Some(transport));
-                info!("reconnected WM transport at {:?}", self.shared_path);
-            }
-            Err(error) => {
-                warn!(
-                    "failed to reconnect WM transport at {:?}: {error}",
-                    self.shared_path
-                );
-            }
-        }
-    }
-
-    fn disconnect_failed_transport(&mut self, update: &RuntimeUpdate) {
-        let transport_failed = update.issues.iter().any(|issue| {
-            matches!(
-                issue,
-                RuntimeIssue::AdapterFailed {
-                    adapter: RuntimeAdapter::Transport,
-                    ..
-                }
-            )
-        });
-        if transport_failed {
-            self.runtime.set_transport(None);
-            self.last_transport_retry = Instant::now();
-        }
     }
 }
 
@@ -196,22 +140,6 @@ fn restore_window_baseline(baseline: WindowBaseline, window: &DesktopContext) {
     ));
 }
 
-fn spawn_and_reap(program: &'static str, args: &'static [&'static str]) {
-    let thread_name = format!("dioxus-bar-{program}");
-    if let Err(error) = thread::Builder::new()
-        .name(thread_name)
-        .spawn(move || match Command::new(program).args(args).status() {
-            Ok(status) if !status.success() => {
-                warn!("{program} exited with status {status}");
-            }
-            Ok(_) => {}
-            Err(error) => warn!("failed to start {program}: {error}"),
-        })
-    {
-        warn!("failed to start {program} waiter thread: {error}");
-    }
-}
-
 fn handle_runtime_update(update: RuntimeUpdate, window: &DesktopContext, baseline: WindowBaseline) {
     for issue in update.issues {
         warn!("xbar runtime issue: {issue:?}");
@@ -222,11 +150,17 @@ fn handle_runtime_update(update: RuntimeUpdate, window: &DesktopContext, baselin
                 apply_monitor_geometry(geometry, window);
             }
             BarEffect::ClearMonitorGeometry => restore_window_baseline(baseline, window),
-            BarEffect::Screenshot => {
-                spawn_and_reap("flameshot", &["gui"]);
-            }
-            BarEffect::OpenAudioControl => {
-                spawn_and_reap("pavucontrol", &[]);
+            effect @ (BarEffect::Screenshot | BarEffect::OpenAudioControl) => {
+                static ACTIONS: OnceLock<Mutex<ProcessActionHandler>> = OnceLock::new();
+                let actions = ACTIONS.get_or_init(|| Mutex::new(ProcessActionHandler::default()));
+                match actions.lock() {
+                    Ok(mut actions) => {
+                        if let Err(error) = actions.handle(effect) {
+                            warn!("failed to handle platform effect: {error}");
+                        }
+                    }
+                    Err(error) => warn!("platform action handler mutex was poisoned: {error}"),
+                }
             }
             unhandled => warn!("unhandled xbar platform effect: {unhandled:?}"),
         }

@@ -9,7 +9,6 @@ use dioxus::{
 use log::{error, info, warn};
 use std::{
     env,
-    process::Command,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -20,7 +19,7 @@ use xbar_core::{
     Percent, PlatformEffectHandler, RuntimeUpdate, SystemDetails, TagId, TagState,
     TransportRecoveryConfig, UserAction,
 };
-use xbar_linux_actions::ProcessActionHandler;
+use xbar_linux_actions::{CommandRunner, CommandSpec, ProcessActionHandler};
 
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const BAR_LOGICAL_HEIGHT: f64 = 40.0;
@@ -435,13 +434,16 @@ fn main() {
     info!("XDG_SESSION_TYPE: {:?}", env::var("XDG_SESSION_TYPE"));
     info!("DESKTOP_SESSION: {:?}", env::var("DESKTOP_SESSION"));
     info!("XDG_CURRENT_DESKTOP: {:?}", env::var("XDG_CURRENT_DESKTOP"));
-    if let Ok(output) = Command::new("xrandr").arg("--current").output() {
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        for line in output_str.lines() {
-            if line.contains("primary") || line.contains("*") {
-                info!("Screen info: {}", line.trim());
+    match CommandRunner::output(&CommandSpec::new("xrandr").with_arg("--current")) {
+        Ok(output) => {
+            let output_str = String::from_utf8_lossy(&output.stdout);
+            for line in output_str.lines() {
+                if line.contains("primary") || line.contains("*") {
+                    info!("Screen info: {}", line.trim());
+                }
             }
         }
+        Err(error) => log::debug!("xrandr diagnostics unavailable: {error}"),
     }
     info!("Starting dioxus_bar v{}", 1.0);
 
